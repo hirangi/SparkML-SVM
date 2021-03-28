@@ -1,0 +1,92 @@
+import org.apache.spark.sql.functions._
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.feature.{RegexTokenizer, Tokenizer}
+import org.apache.spark.ml.feature.StopWordsRemover
+import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel}
+import org.apache.spark.ml.feature.NGram
+import org.apache.spark.ml.feature.{HashingTF, IDF, Tokenizer}
+import org.apache.spark.sql.types.{IntegerType, DoubleType}
+import org.apache.spark.ml.evaluation.{RegressionEvaluator, MulticlassClassificationEvaluator}
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.ml.feature.{VectorAssembler, StringIndexer}
+import org.apache.spark.ml.tuning.{CrossValidator, CrossValidatorModel, ParamGridBuilder}
+import org.apache.spark.ml.evaluation.{MulticlassClassificationEvaluator}
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.sql.Column
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.ml.classification.LinearSVC
+
+import org.apache.spark.sql.SQLContext
+val sqlContext = new SQLContext(sc)
+
+//loading json data into data frame
+val review_data = sqlContext.read.json("/home/happy/review-1000.json")
+review_data.show()
+
+//removing all review with 3 stars
+var review_filter_3star=review_data.filter(col("stars") !=="3")
+review_filter_3star.show()
+
+//combining 1 & 2 stars as BAD & 4 & 5 stars as GOOD(giving 1&2 star rating 0 and 4&5 Good)
+var review_category = review_filter_3star.withColumn("Rating_labels",when(col("Stars") === "4" || col("stars") === "5", "Good").otherwise(0))
+review_category.show()
+
+//Giving 1 rating to Good
+val review_rating = review_category.withColumn("number_Rating", when((col("Rating_labels") === "Good"),1).otherwise(0))
+review_rating.show()
+
+//creating list of words based on text field
+val review_tokenizer = new Tokenizer().setInputCol("text").setOutputCol("tokenized_review")
+val review_tokenized_regexp = new RegexTokenizer().setInputCol("text").setOutputCol("tokenized_review").setPattern("\\W") // alternatively .setPattern("\\w+").setGaps(false)
+val review_token_counts = udf { (tokenized_review: Seq[String]) => tokenized_review.length }
+val review_tokenized = review_tokenizer.transform(review_category)
+review_tokenized.select("text", "tokenized_review").withColumn("tokens", review_token_counts(col("tokenized_review"))).show(false)
+val review_regexp_tokenized = review_tokenized_regexp.transform(review_category)
+review_regexp_tokenized.select("text", "tokenized_review").withColumn("tokens", review_token_counts(col("tokenized_review"))).show(false)
+
+//removing all stop words from list
+val stopword_remover = new StopWordsRemover()
+.setInputCol("tokenized_review")
+.setOutputCol("review_without_stopword")
+val stopword_removed_review = stopword_remover.transform(review_regexp_tokenized)
+stopword_removed_review.show()
+
+//making pair of words from the list
+val bigram = new NGram().setN(2).setInputCol("review_without_stopword").setOutputCol("bigram_review")
+val review_bigram = bigram.transform(stopword_removed_review)
+review_bigram.select("bigram_review").show()
+val review_hashingTF = new HashingTF().setInputCol("review_without_stopword").setOutputCol("RawReviewFeature").setNumFeatures(25)
+val featurized_review = review_hashingTF.transform(review_bigram)
+val inverse_review = new IDF().setInputCol("RawReviewFeature").setOutputCol("supressed_review_feature")
+val inv_review_model = inverse_review.fit(featurized_review)
+val review_rescale = inv_review_model.transform(featurized_review)
+val review_rescaled = review_rescale.select("supressed_review_feature")
+review_rescale.show()
+
+val review_lsvc = new LinearSVC().setFeaturesCol("supressed_review_feature").setLabelCol("number_Rating")
+val review_pipeline = new Pipeline().setStages(Array(review_tokenized_regexp,stopword_remover,bigram,review_hashingTF,inverse_review,review_lsvc))
+val review_evaluator = new MulticlassClassificationEvaluator()
+  .setLabelCol("number_Rating")
+  .setPredictionCol("prediction")
+  .setMetricName("accuracy")
+val review_cross_validator = new CrossValidator()
+ .setEstimator(review_pipeline)
+ .setEvaluator(review_evaluator)
+ .setEstimatorParamMaps(new ParamGridBuilder().build)
+ .setNumFolds(4)
+val Array(review_trainingData, review_testData) = review_rating.randomSplit(Array(0.85, 0.15),3296)
+val review_train_model = review_cross_validator.fit(review_trainingData)
+
+//Predicting reviews with test data
+val review_predictions = review_train_model.transform(review_testData)
+
+
+review_predictions
+ .select(col("number_Rating"), col("review_id"),col("business_id"), col("prediction"))
+ .write
+ .format("csv")
+ .save("file:////home/happy/review_output")
+
+
+//checking accuracy of test data
+val review_accuracy = review_evaluator.evaluate(review_predictions)
